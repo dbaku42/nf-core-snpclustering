@@ -1,270 +1,427 @@
 #!/usr/bin/env nextflow
 nextflow.enable.dsl=2
 
-// Define input parameters with default values
-params.vcf_file = "input.vcf.gz" // Can be .vcf or .vcf.gz
-params.out_dir = "results"
-params.n_clusters = 4            // Desired number of clusters for K-Means
-params.max_k_elbow = 10          // Max k to test for the elbow plot
+// ===============================
+// Parameters (overridable via CLI)
+// ===============================
+params.vcf_file             = "input.vcf.gz"     // --vcf_file <path>
+params.out_dir              = "results"          // --out_dir <dir>
 
-/*
-========================================================================================
-    Process 1: Extract, filter, and prepare the genotype matrix
-========================================================================================
-*/
+params.variant_type         = "SNPs"             // "SNPs" | "INDELs" | "ALL"
+params.maf_filter           = 0.01               // --maf_filter 0.01
+params.na_filter            = 0.10               // --na_filter 0.10
+
+// LD pruning (PLINK2)
+params.ld_prune             = true               // --ld_prune true|false
+params.plink_window_kb      = 250                // --plink_window_kb 250
+params.plink_polyploid_mode = 'missing'          // --plink_polyploid_mode 'missing'|'error'|'allow' (default 'missing')
+// plink step è 1 in modalità 'kb' con PLINK2 (indicato in script)
+params.plink_r2             = 0.2                // --plink_r2 0.2
+
+// PCA + t-SNE + clustering
+params.pca_target_variance  = 0.80               // --pca_target_variance 0.8
+params.tsne_perplexity      = 30                 // --tsne_perplexity 50
+params.n_clusters           = 4                  // --n_clusters 3
+params.max_k_elbow          = 10                 // --max_k_elbow 10
+
+// Resources
+params.mem_pca              = '16 GB'            // --mem_pca '24 GB'
+params.mem_cluster          = '8 GB'             // --mem_cluster '12 GB'
+
+// ===============================
+// Workflow
+// ===============================
+workflow {
+    // 0) Input
+    vcf_ch = Channel.fromPath(params.vcf_file)
+
+    // 1) Prefiltro VCF (MAF + tipo variante)
+	vcf_id_ch = vcf_ch.map { file -> tuple(file.baseName.replaceAll(/\.(vcf|vcf\.gz)$/, ''), file) }
+	prefiltered_ch = prefilter_vcf(vcf_id_ch)
+
+    // 2) LD pruning opzionale con PLINK2 -> VCF pruned
+    if (params.ld_prune) {
+        pgen_ch        = vcf_to_plink2(prefiltered_ch)               // (id, .pgen, .pvar, .psam)
+        pruned_pgen_ch = plink2_ld_prune(pgen_ch)                     // (id, .pruned.pgen/.pvar/.psam, .prune.in/.out)
+        pruned_vcf_ch  = plink2_export_pruned_vcf(
+                           pruned_pgen_ch.map { id, pgen, pvar, psam, pin, pout -> tuple(id, pgen, pvar, psam) }
+                         )                                            // (id, .pruned.vcf.gz)
+        vcf_for_matrix_ch = pruned_vcf_ch                             // (id, vcf.gz)
+    } else {
+        vcf_for_matrix_ch = prefiltered_ch                            // (id, vcf.gz)
+    }
+
+    // 3) Estrazione matrice genotipi (samples x variants), imputazione mean
+    matrix_ch = extract_genotype_matrix(vcf_for_matrix_ch)            // (id, genotype_matrix_imputed.npy, samples.txt)
+
+    // 4) PCA su varianza cumulativa target (streaming)
+    pca_ch = perform_pca(matrix_ch)                                   // (id, pca_coords.csv, pca_plot.png)
+
+    // 5) t‑SNE sui punteggi PCA
+    tsne_ch = perform_tsne_visualization(pca_ch)                      // (id, tsne_coords.csv, tsne_plot.png)
+
+    // 6) Join PCA + t‑SNE per clustering e plot colorati
+    pca_kv  = pca_ch .map { id, pca_csv,  pca_png  -> tuple(id, [pca_csv,  pca_png]) }
+    tsne_kv = tsne_ch.map { id, tsne_csv, tsne_png -> tuple(id, [tsne_csv, tsne_png]) }
+    clust_in = pca_kv.join(tsne_kv)                                   // join su id
+                    .map { id, p, t -> tuple(id, p[0], p[1], t[0], t[1]) } // (id, pca_csv, pca_png, tsne_csv, tsne_png)
+    perform_clustering(clust_in)                                      // cluster_labels.csv + plot
+}
+
+// ===============================
+// Process 1: Prefilter VCF
+// ===============================
+process prefilter_vcf {
+    publishDir "${params.out_dir}/prefiltered_vcf", mode: 'copy'
+    conda 'bioconda::bcftools=1.15.1'
+    tag "${vcf_file.baseName}"
+
+    input:
+    tuple val(id), path(vcf_file)
+
+    output:
+    tuple val(id), path("filtered.vcf.gz")
+
+    when:
+    true
+
+    script:
+    def vtype = params.variant_type.toUpperCase()
+    def type_filter = vtype == 'ALL' ? '' : "--types ${params.variant_type.toLowerCase()}"
+    // prefisso 'id' senza estensioni per PLINK2
+    def id = vcf_file.getName().replaceAll(/\.vcf\.gz$/, '').replaceAll(/\.vcf$/, '')
+    """
+    set -euo pipefail
+    bcftools view -i 'MAF > ${params.maf_filter}' ${type_filter} -O z -o filtered.vcf.gz ${vcf_file}
+    """
+}
+
+// ===============================
+// Process 2a: VCF -> PLINK2 pgen
+// ===============================
+process vcf_to_plink2 {
+    publishDir "${params.out_dir}/plink", mode: 'copy'
+    conda 'bioconda::plink2=2.00a3'
+    tag "${name}"
+
+    input:
+    tuple val(name), path(vcf_gz)
+
+    output:
+    tuple val(name), path("${name}.pgen"), path("${name}.pvar"), path("${name}.psam")
+
+    script:
+    """
+    set -euo pipefail
+    # assicurati che il VCF sia indicizzato con tabix (utile per chunking/controlli)
+    if [[ ! -f "${vcf_gz}.tbi" ]]; then
+      if command -v tabix >/dev/null 2>&1; then
+        tabix -p vcf ${vcf_gz} || true
+      fi
+    fi
+    # Prefisso --out senza estensioni
+    plink2 --vcf ${vcf_gz} --polyploid-mode ${params.plink_polyploid_mode} --make-pgen --out ${name}
+    """
+}
+
+// ===============================
+// Process 2b: PLINK2 LD prune (kb, step=1)
+// ===============================
+process plink2_ld_prune {
+    publishDir "${params.out_dir}/plink_pruned", mode: 'copy'
+    conda 'bioconda::plink2=2.00a3'
+    tag "${name}"
+
+    input:
+    tuple val(name), path(pgen), path(pvar), path(psam)
+
+    output:
+    tuple val(name),
+          path("${name}.pruned.pgen"),
+          path("${name}.pruned.pvar"),
+          path("${name}.pruned.psam"),
+          path("${name}.prune.in"),
+          path("${name}.prune.out")
+
+    script:
+    """
+    set -euo pipefail
+    # LD pruning in kb, step fisso a 1
+    plink2 --pfile ${name} --indep-pairwise ${params.plink_window_kb}kb 1 ${params.plink_r2} --out ${name}
+    # Applica il pruning
+    plink2 --pfile ${name} --extract ${name}.prune.in --make-pgen --out ${name}.pruned
+    """
+}
+
+// ===============================
+// Process 2c: Esporta VCF pruned
+// ===============================
+process plink2_export_pruned_vcf {
+    publishDir "${params.out_dir}/plink_pruned", mode: 'copy'
+    conda 'bioconda::plink2=2.00a3'
+    tag "${name}"
+
+    input:
+    tuple val(name), path(pruned_pgen), path(pruned_pvar), path(pruned_psam)
+
+    output:
+    tuple val(name), path("${name}.pruned.vcf.gz")
+
+    script:
+    """
+    set -euo pipefail
+    plink2 --pfile ${name}.pruned --recode vcf bgz --out ${name}.pruned
+    """
+}
+
+// ===============================
+// Process 3: Estrazione matrice genotipi (samples x variants)
+// ===============================
 process extract_genotype_matrix {
     publishDir "${params.out_dir}/genotype_data", mode: 'copy'
+    conda 'bioconda::scikit-allel=1.3.2 conda-forge::pandas=1.3.4 conda-forge::scikit-learn=1.0.2'
+    tag "${name}"
 
     input:
-    path vcf_file
+    tuple val(name), path(vcf_gz)
 
     output:
-    path "genotype_matrix.npy", emit: genotype_matrix
-    path "samples.txt", emit: samples_list
-    path "variants_filtered.txt", emit: variants_list
+    tuple val(name), path("genotype_matrix_imputed.npy"), path("samples.txt")
 
     script:
     """
     #!/usr/bin/env python
-    import allel
-    import numpy as np
-    import pandas as pd
+    import allel, numpy as np, pandas as pd
+    from sklearn.impute import SimpleImputer
 
-    print(f"Processing VCF file: ${vcf_file}")
-    vcf = allel.read_vcf("${vcf_file}", fields=['calldata/GT', 'variants/ID', 'samples'])
-    gt = allel.GenotypeArray(vcf['calldata/GT'])
-    gm = gt.to_n_alt(1)
-    print(f"Initial genotype matrix shape: {gm.shape}")
+    v = allel.read_vcf('${vcf_gz}', fields=['samples','calldata/GT'])
+    if v is None or len(v['samples']) == 0:
+        np.save('genotype_matrix_imputed.npy', np.array([])); open('samples.txt','w').close(); raise SystemExit(0)
 
-    # Filter 1: Drop SNPs with NA >= 5%
-    missing_rate = np.count_nonzero(gm == -1, axis=1) / gm.shape[1]
-    na_filter_mask = missing_rate < 0.05
-    gm_filtered_na = gm[na_filter_mask]
-    variants_filtered_na = vcf['variants/ID'][na_filter_mask]
-    print(f"Shape after NA filter: {gm_filtered_na.shape}")
+    gt = allel.GenotypeArray(v['calldata/GT'])     # (variants, samples, ploidy)
+    gm = gt.to_n_alt()                              # (variants, samples), missing -> -1
 
-    # Filter 2: Drop SNPs with variance < 0.05
-    gm_imputed_for_var = np.copy(gm_filtered_na).astype(float)
-    for i in range(gm_imputed_for_var.shape[0]):
-        variant_row = gm_imputed_for_var[i, :]
-        non_missing = variant_row[variant_row != -1]
-        if non_missing.size > 0:
-            row_mean = non_missing.mean()
-            variant_row[variant_row == -1] = row_mean
-            gm_imputed_for_var[i, :] = variant_row
-    
-    variance = np.var(gm_imputed_for_var, axis=1)
-    var_filter_mask = variance >= 0.05
-    gm_final = gm_filtered_na[var_filter_mask]
-    variants_final = variants_filtered_na[var_filter_mask]
-    print(f"Shape after variance filter: {gm_final.shape}")
+    missing_rate = (gm == -1).sum(axis=1) / gm.shape[1]
+    keep = missing_rate < ${params.na_filter}
+    gm_f = gm[keep, :]
 
-    np.save("genotype_matrix.npy", gm_final)
+    if gm_f.shape[0] == 0:
+        np.save('genotype_matrix_imputed.npy', np.array([])); open('samples.txt','w').close(); raise SystemExit(0)
 
-    samples = vcf['samples']
-    with open("samples.txt", "w") as f:
-        for sample_id in samples: f.write(f"{sample_id}\\n")
+    # Imputazione mean per variante e formato finale (samples x variants)
+    X = gm_f.T
+    X_imp = SimpleImputer(missing_values=-1, strategy='mean').fit_transform(X)
 
-    with open("variants_filtered.txt", "w") as f:
-        for variant_id in variants_final: f.write(f"{variant_id}\\n")
-    del vcf
+    np.save('genotype_matrix_imputed.npy', X_imp)
+    pd.Series(v['samples']).to_csv('samples.txt', index=False, header=False)
     """
 }
 
-/*
-========================================================================================
-    Process 2: Standard Scaling and Principal Component Analysis (PCA)
-========================================================================================
-*/
+// ===============================
+// Process 4: PCA (IncrementalPCA, varianza target)
+// ===============================
 process perform_pca {
     publishDir "${params.out_dir}/pca_results", mode: 'copy'
+    conda 'conda-forge::scikit-learn=1.0.2 conda-forge::pandas=1.3.4 conda-forge::matplotlib-base=3.5.0 conda-forge::seaborn-base=0.11.2'
+    cpus 2
+    memory { params.mem_pca }
+    tag "${name}"
 
     input:
-    path genotype_matrix
-    path samples_list
+    tuple val(name), path(imputed_matrix), path(samples_list)
 
     output:
-    path "pca_coords.csv", emit: pca_results_csv
+    tuple val(name), path("pca_coords.csv"), path("pca_plot.png")
 
     script:
     """
     #!/usr/bin/env python
-    import numpy as np
-    import pandas as pd
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
+    import numpy as np, pandas as pd
+    from sklearn.decomposition import IncrementalPCA
+    import matplotlib.pyplot as plt, seaborn as sns
 
-    gm = np.load("${genotype_matrix}")
-    samples = pd.read_csv("${samples_list}", header=None)[0].tolist()
-    
-    gm_transposed = gm.T
-    scaler = StandardScaler()
-    gm_scaled = scaler.fit_transform(gm_transposed)
-    
-    # We run PCA for enough components to be used in clustering and plotting
-    n_components_pca = min(10, len(samples) - 1, gm_scaled.shape[1])
-    pca = PCA(n_components=n_components_pca)
-    coords = pca.fit_transform(gm_scaled)
-    
-    explained_variance = pca.explained_variance_ratio_
-    
-    # Save results to a CSV file
-    pc_cols = [f"PC{i+1}" for i in range(coords.shape[1])]
-    coords_df = pd.DataFrame(coords, columns=pc_cols, index=samples)
+    X_mm = np.load('${imputed_matrix}', mmap_mode='r')   # (samples, variants)
+    n_samples, n_features = X_mm.shape if X_mm.size else (0, 0)
+    if X_mm.size == 0 or n_samples < 2 or n_features < 2:
+        pd.DataFrame(columns=['Sample']).to_csv('pca_coords.csv', index=False)
+        plt.figure(); plt.text(0.5,0.5,'Not enough data for PCA', ha='center', va='center'); plt.savefig('pca_plot.png'); raise SystemExit(0)
 
-    # Also save explained variance
-    coords_df.to_csv("pca_coords.csv", index_label="SampleID")
-    
-    print("PCA calculation complete and coordinates saved.")
+    mean = np.asarray(X_mm.mean(axis=0), dtype=np.float32)
+    max_comp = int(min(n_samples-1, n_features, 200))
+    batch = 1024
+
+    ipca = IncrementalPCA(n_components=max_comp, batch_size=batch)
+    for s in range(0, n_samples, batch):
+        e = min(s+batch, n_samples)
+        chunk = X_mm[s:e, :].astype(np.float32, copy=False); chunk -= mean
+        ipca.partial_fit(chunk)
+
+    Z_parts = []
+    for s in range(0, n_samples, batch):
+        e = min(s+batch, n_samples)
+        chunk = X_mm[s:e, :].astype(np.float32, copy=False); chunk -= mean
+        Z_parts.append(ipca.transform(chunk))
+    Z = np.vstack(Z_parts)
+
+    ev = ipca.explained_variance_ratio_; cum = ev.cumsum()
+    target = float(${params.pca_target_variance})
+    k = int(np.searchsorted(cum, target) + 1); k = max(1, min(k, Z.shape[1]))
+
+    Zk = Z[:, :k]
+    samples = pd.read_csv('${samples_list}', header=None)[0].tolist()
+    cols = [f'PC{i+1}' for i in range(k)]
+    df = pd.DataFrame(Zk, columns=cols); df['Sample'] = samples
+    df = df[['Sample'] + cols]; df.to_csv('pca_coords.csv', index=False)
+
+    plt.figure(figsize=(12,8))
+    if k >= 2:
+        ax = sns.scatterplot(x='PC1', y='PC2', data=df, s=100)
+        plt.xlabel(f'PC1 ({ev[0]:.2%})'); plt.ylabel(f'PC2 ({ev[1]:.2%})')
+        for i, r in df.iterrows(): ax.text(r['PC1'], r['PC2'], r['Sample'], fontsize=8)
+    else:
+        plt.scatter(df['PC1'], [0]*len(df), s=100)
+        for i, r in df.iterrows(): plt.text(r['PC1'], 0.02, r['Sample'], fontsize=8)
+        plt.xlabel(f'PC1 ({ev[0]:.2%})'); plt.ylabel('PC2 (NA)')
+    plt.title(f'PCA (components kept: {k}, total var: {cum[k-1]:.2%})'); plt.grid(True); plt.savefig('pca_plot.png')
     """
 }
 
-/*
-========================================================================================
-    Process 3: K-Means Cluster Analysis
-========================================================================================
-*/
-process perform_clustering {
-    publishDir "${params.out_dir}/cluster_analysis", mode: 'copy'
-
-    input:
-    path pca_results_csv
-
-    output:
-    path "cluster_assignments.csv", emit: cluster_assignments_csv
-    path "elbow_plot.png", emit: elbow_plot
-    path "pca_clustered_plot.png", emit: pca_clustered_plot
-
-    script:
-    """
-    #!/usr/bin/env python
-    import pandas as pd
-    import matplotlib.pyplot as plt
-    from sklearn.cluster import KMeans
-
-    pca_df = pd.read_csv("${pca_results_csv}", index_col="SampleID")
-
-    # --- Elbow Method to find optimal K ---
-    # Use the first 10 PCs or fewer if not available
-    n_pcs_to_use = min(10, pca_df.shape[1])
-    pca_data_for_clustering = pca_df.iloc[:, :n_pcs_to_use]
-    
-    inertia = []
-    max_k = min(${params.max_k_elbow}, len(pca_df) - 1)
-    k_range = range(1, max_k + 1)
-    
-    for k in k_range:
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto').fit(pca_data_for_clustering)
-        inertia.append(kmeans.inertia_)
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(k_range, inertia, 'bo-')
-    plt.xlabel('Number of Clusters (k)')
-    plt.ylabel('Inertia (Within-cluster sum of squares)')
-    plt.title('Elbow Method For Optimal k')
-    plt.grid(True)
-    plt.savefig("elbow_plot.png")
-    plt.close()
-
-    # --- Perform Final Clustering with specified n_clusters ---
-    n_clusters = ${params.n_clusters}
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto').fit(pca_data_for_clustering)
-    clusters = kmeans.labels_
-
-    # Save cluster assignments
-    assignments_df = pd.DataFrame({'Cluster': clusters}, index=pca_df.index)
-    assignments_df.to_csv("cluster_assignments.csv")
-
-    # --- Create Clustered PCA Plot ---
-    plt.figure(figsize=(12, 10))
-    scatter = plt.scatter(pca_df['PC1'], pca_df['PC2'], c=clusters, cmap='viridis', alpha=0.8)
-    plt.xlabel(f"PC1")
-    plt.ylabel(f"PC2")
-    plt.title(f'PCA colored by K-Means Clusters (k={n_clusters})')
-    plt.legend(handles=scatter.legend_elements()[0], labels=[f'Cluster {i}' for i in range(n_clusters)], title="Clusters")
-    plt.grid(True)
-    plt.savefig("pca_clustered_plot.png")
-    plt.close()
-    """
-}
-
-/*
-========================================================================================
-    Process 4: t-SNE Visualization with Cluster Colors
-========================================================================================
-*/
+// ===============================
+// Process 5: t‑SNE  on PCA_data
+// ===============================
 process perform_tsne_visualization {
     publishDir "${params.out_dir}/tsne_results", mode: 'copy'
+    conda 'conda-forge::scikit-learn=1.0.2 conda-forge::pandas=1.3.4 conda-forge::matplotlib-base=3.5.0 conda-forge::seaborn-base=0.11.2'
+    tag "${name}"
 
     input:
-    path pca_results_csv
-    path cluster_assignments_csv
+    tuple val(name), path(pca_coords_csv), path(pca_plot)
 
     output:
-    path "tsne_coords.csv", emit: tsne_results_csv
-    path "tsne_clustered_plot.png", emit: tsne_plot
+    tuple val(name), path("tsne_coords.csv"), path("tsne_plot.png")
 
     script:
     """
     #!/usr/bin/env python
     import pandas as pd
-    import matplotlib.pyplot as plt
+    import matplotlib.pyplot as plt, seaborn as sns
     from sklearn.manifold import TSNE
 
-    pca_df = pd.read_csv("${pca_results_csv}", index_col="SampleID")
-    cluster_df = pd.read_csv("${cluster_assignments_csv}", index_col="SampleID")
-    
-    # Align data before t-SNE
-    data = pca_df.join(cluster_df)
+    df = pd.read_csv('${pca_coords_csv}')
+    pcs = [c for c in df.columns if c.startswith('PC')]
+    if len(df) <= 1 or not pcs:
+        pd.DataFrame(columns=['Sample','TSNE1','TSNE2']).to_csv('tsne_coords.csv', index=False)
+        plt.figure(); plt.text(0.5,0.5,'Not enough data for t-SNE', ha='center', va='center'); plt.savefig('tsne_plot.png'); raise SystemExit(0)
 
-    n_samples = len(data)
-    perplexity_value = min(30.0, n_samples - 1.0)
-    
-    tsne = TSNE(n_components=2, perplexity=perplexity_value, learning_rate='auto', random_state=42)
-    tsne_coords = tsne.fit_transform(data.iloc[:, :-1]) # Use PCA coords for t-SNE
+    X = df[pcs]
+    perpl = min(float(${params.tsne_perplexity}), len(df)-1.0)
+    try:
+        tsne = TSNE(n_components=2, perplexity=perpl, random_state=42, max_iter=1000)
+    except TypeError:
+        tsne = TSNE(n_components=2, perplexity=perpl, random_state=42, n_iter=1000)
 
-    tsne_df = pd.DataFrame(tsne_coords, columns=["tSNE1", "tSNE2"], index=data.index)
-    tsne_df.to_csv("tsne_coords.csv")
+    T = tsne.fit_transform(X)
+    out = pd.DataFrame(T, columns=['TSNE1','TSNE2']); out['Sample'] = df['Sample']
+    out[['Sample','TSNE1','TSNE2']].to_csv('tsne_coords.csv', index=False)
 
-    # Create plot colored by cluster assignment
-    plt.figure(figsize=(12, 10))
-    clusters = data['Cluster']
-    n_clusters = len(clusters.unique())
-    scatter = plt.scatter(tsne_df['tSNE1'], tsne_df['tSNE2'], c=clusters, cmap='viridis', alpha=0.8)
-    plt.xlabel("t-SNE 1")
-    plt.ylabel("t-SNE 2")
-    plt.title('t-SNE colored by K-Means Clusters')
-    plt.legend(handles=scatter.legend_elements()[0], labels=[f'Cluster {i}' for i in range(n_clusters)], title="Clusters")
-    plt.grid(True)
-    plt.savefig("tsne_clustered_plot.png")
-    plt.close()
+    plt.figure(figsize=(12,8))
+    ax = sns.scatterplot(x='TSNE1', y='TSNE2', data=out, s=100)
+    plt.title(f't-SNE (using {len(pcs)} PCs, perplexity: {perpl})')
+    for i, r in out.iterrows(): ax.text(r['TSNE1'], r['TSNE2'], r['Sample'], fontsize=8)
+    plt.grid(True); plt.savefig('tsne_plot.png')
     """
 }
 
-/*
-========================================================================================
-    Workflow Definition
-========================================================================================
-*/
-workflow {
-    // Define input channel
-    vcf_ch = Channel.fromPath(params.vcf_file, checkIfExists: true)
+// ===============================
+// Process 6: Clustering on PCA data + colored plots and metrics
+// ===============================
+process perform_clustering {
+    publishDir "${params.out_dir}/clustering_results", mode: 'copy'
+    conda 'conda-forge::scikit-learn=1.0.2 conda-forge::pandas=1.3.4 conda-forge::matplotlib-base=3.5.0'
+    cpus 2
+    memory { params.mem_cluster }
+    tag "${name}"
 
-    // 1. Extract and filter genotype data
-    extract_genotype_matrix(vcf_ch)
+    input:
+    tuple val(name), path(pca_coords_csv), path(pca_plot), path(tsne_coords_csv), path(tsne_plot)
 
-    // 2. Perform scaling and PCA
-    perform_pca(
-        extract_genotype_matrix.out.genotype_matrix,
-        extract_genotype_matrix.out.samples_list
-    )
+    output:
+    tuple val(name),
+          path("cluster_labels.csv"),
+          path("elbow_plot.png"),
+          path("silhouette_plot.png"),
+          path("pca_cluster_plot.png"),
+          path("tsne_cluster_plot.png")
 
-    // 3. Perform K-Means clustering on PCA results
-    perform_clustering(perform_pca.out.pca_results_csv)
+    script:
+    """
+    #!/usr/bin/env python
+    import numpy as np, pandas as pd, matplotlib.pyplot as plt
+    from sklearn.cluster import MiniBatchKMeans
+    from sklearn.metrics import silhouette_score
 
-    // 4. Perform t-SNE and visualize with cluster labels
-    perform_tsne_visualization(
-        perform_pca.out.pca_results_csv,
-        perform_clustering.out.cluster_assignments_csv
-    )
+    pca_df  = pd.read_csv('${pca_coords_csv}')
+    tsne_df = pd.read_csv('${tsne_coords_csv}')
+    pc_cols = [c for c in pca_df.columns if c.startswith('PC')]
+
+    if len(pca_df) < 2 or not pc_cols:
+        pd.DataFrame(columns=['Sample','Cluster']).to_csv('cluster_labels.csv', index=False)
+        for fn in ['elbow_plot.png','silhouette_plot.png','pca_cluster_plot.png','tsne_cluster_plot.png']:
+            plt.figure(); plt.text(0.5,0.5,'Not enough data', ha='center', va='center'); plt.savefig(fn); plt.clf()
+        raise SystemExit(0)
+
+    X = pca_df[pc_cols].to_numpy(dtype=np.float32, copy=False)
+    samples = pca_df['Sample'].tolist()
+
+    ks = list(range(2, min(${params.max_k_elbow}, len(pca_df)-1) + 1))
+    inertia, sils = [], []
+    for k in ks:
+        km = MiniBatchKMeans(n_clusters=k, random_state=42, batch_size=1024, n_init='auto', max_iter=100)
+        labels = km.fit_predict(X)
+        inertia.append(km.inertia_)
+        try:
+            sils.append(silhouette_score(X, labels) if 2 <= len(set(labels)) <= (len(X)-1) else np.nan)
+        except Exception:
+            sils.append(np.nan)
+
+    plt.figure(figsize=(10,6)); plt.plot(ks, inertia, marker='o')
+    plt.title('Elbow Method (PCA space)'); plt.xlabel('k'); plt.ylabel('Inertia'); plt.grid(True)
+    plt.savefig('elbow_plot.png'); plt.clf()
+
+    plt.figure(figsize=(10,6)); plt.plot(ks, sils, marker='o', color='orange')
+    plt.title('Silhouette score vs k (PCA space)'); plt.xlabel('k'); plt.ylabel('Silhouette score'); plt.grid(True)
+    plt.savefig('silhouette_plot.png'); plt.clf()
+
+    final_k = min(${params.n_clusters}, max(2, len(pca_df)-1))
+    km = MiniBatchKMeans(n_clusters=final_k, random_state=42, batch_size=1024, n_init='auto', max_iter=200)
+    labels = km.fit_predict(X)
+    pd.DataFrame({'Sample': samples, 'Cluster': labels}).to_csv('cluster_labels.csv', index=False)
+
+    cmap = plt.cm.get_cmap('tab10', final_k)
+
+    # PCA colorato per cluster
+    plt.figure(figsize=(12,8))
+    if len(pc_cols) >= 2:
+        x, y = pca_df['PC1'].to_numpy(), pca_df['PC2'].to_numpy()
+        plt.scatter(x, y, c=labels, cmap=cmap, s=100, edgecolor='k')
+        for xi, yi, name in zip(x, y, samples): plt.text(xi, yi, name, fontsize=8, ha='left', va='bottom')
+        plt.xlabel('PC1'); plt.ylabel('PC2'); plt.title(f'PCA colored by clusters (k={final_k})'); plt.grid(True)
+    else:
+        x = pca_df['PC1'].to_numpy()
+        plt.scatter(x, np.zeros_like(x), c=labels, cmap=cmap, s=100, edgecolor='k')
+        for xi, name in zip(x, samples): plt.text(xi, 0.02, name, fontsize=8, ha='left', va='bottom')
+        plt.xlabel('PC1'); plt.ylabel('PC2'); plt.title(f'PCA colored by clusters (k={final_k})'); plt.grid(True)
+    plt.savefig('pca_cluster_plot.png'); plt.clf()
+
+    # t‑SNE colorato (allineamento su Sample)
+    if set(['Sample','TSNE1','TSNE2']).issubset(tsne_df.columns):
+        m = tsne_df.merge(pd.DataFrame({'Sample': samples, 'Cluster': labels}), on='Sample', how='inner')
+        plt.figure(figsize=(12,8))
+        plt.scatter(m['TSNE1'], m['TSNE2'], c=m['Cluster'], cmap=cmap, s=100, edgecolor='k')
+        for xi, yi, name in zip(m['TSNE1'], m['TSNE2'], m['Sample']): plt.text(xi, yi, name, fontsize=8, ha='left', va='bottom')
+        plt.title(f't-SNE colored by clusters (k={final_k})'); plt.xlabel('TSNE1'); plt.ylabel('TSNE2'); plt.grid(True)
+        plt.savefig('tsne_cluster_plot.png'); plt.clf()
+    else:
+        plt.figure(); plt.text(0.5,0.5,'No t-SNE data', ha='center', va='center'); plt.savefig('tsne_cluster_plot.png'); plt.clf()
+    """
 }
