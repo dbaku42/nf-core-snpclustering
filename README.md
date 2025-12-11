@@ -87,10 +87,16 @@ You can manage the Python environment with `conda`, `mamba`, or `venv`.
 
 ## 3. Basic usage
 
-Minimal example:
-
-```bash
 nextflow run main.nf \
   --vcf path/to/input.vcf.gz \
   --outdir path/to/results \
-  --n_clusters 3
+  --n_clusters 3 \
+  --na_filter 0.20 \
+  --pca_target_var 0.7 \
+  --tsne_perplexity 30.0 \
+  --tsne_n_iter 1000 \
+  --umap_n_neighbors 25 \
+  --umap_min_dist 0.1 \
+  --umap_n_components 2 \
+  --umap_metric manhattan
+
