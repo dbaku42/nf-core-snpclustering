@@ -1,27 +1,36 @@
-process BCFTOOLS_FILTER {
-
-    publishDir "${params.outdir}/vcf_filtered", mode: 'copy'
-
+process PREPROCESS_VCF {
     tag { vcf.baseName }
-
-    if( params.container ) container { params.container }
-    cpus params.threads
-    memory '8 GB'
+    cpus { params.threads as int }
+    container params.bcftools_container
+    publishDir "${params.outdir}/01_preprocess", mode: 'copy'
 
     input:
-      path vcf
+    path vcf
 
     output:
-      path "*.filtered.vcf.gz"
+    path 'filtered.vcf.gz',     emit: vcf
+    path 'filtered.vcf.gz.tbi', emit: tbi
 
     script:
+    def maf = params.maf
+    def miss = params.missing
     """
-    bcftools view \
-      -Oz -o ${vcf.baseName}.filtered.vcf.gz \
-      -q ${params.maf}:minor \
-      -e 'F_MISSING > ${params.missing}' \
-      ${vcf}
+    set -euo pipefail
 
-    bcftools index -t ${vcf.baseName}.filtered.vcf.gz
+    # Add INFO tags if missing and filter.
+    bcftools +fill-tags ${vcf} -Oz -o filled.vcf.gz -- -t MAF,F_MISSING
+    bcftools view -i 'MAF>=${maf} && F_MISSING<=${miss}' -Oz -o filtered.vcf.gz filled.vcf.gz
+    tabix -f -p vcf filtered.vcf.gz
     """
+}
+
+workflow preprocess_ch {
+    take:
+    vcf_ch
+
+    main:
+    out = PREPROCESS_VCF(vcf_ch)
+
+    emit:
+    out.vcf
 }
