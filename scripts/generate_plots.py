@@ -1,250 +1,193 @@
 #!/usr/bin/env python3
 
+"""Cluster visualizations.
+
+Produces three 2D plots, all colored by cluster label:
+  - PCA (first two columns from pca_scores)
+  - UMAP (computed on the feature matrix used for clustering)
+  - t-SNE (computed on the feature matrix used for clustering)
+
+Also writes UMAP and t-SNE coordinates to TSV.
+"""
+
 import argparse
-import os
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
+
 from sklearn.manifold import TSNE
 
-try:
+
+def load_features(path: str) -> tuple[pd.DataFrame, pd.Index]:
+    df = pd.read_csv(path, sep="\t")
+    if "sample_id" not in df.columns:
+        raise ValueError("features TSV must have a 'sample_id' column")
+    sample_ids = df["sample_id"].astype(str)
+    X = (
+        df.drop(columns=["sample_id"])
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+    )
+    return X, sample_ids
+
+
+def load_clusters(path: str) -> pd.Series:
+    df = pd.read_csv(path, sep="\t")
+    if "sample_id" not in df.columns or "cluster" not in df.columns:
+        raise ValueError("clusters TSV must have columns: sample_id, cluster")
+    df["sample_id"] = df["sample_id"].astype(str)
+    return df.set_index("sample_id")["cluster"].astype(int)
+
+
+def safe_perplexity(n_samples: int, requested: float) -> float:
+    """t-SNE requires perplexity < n_samples. Use a safe bound."""
+    if n_samples <= 3:
+        return 1.0
+    upper = (n_samples - 1) / 3.0
+    return float(max(2.0, min(requested, upper)))
+
+
+def compute_umap(X: np.ndarray, n_neighbors: int, min_dist: float) -> np.ndarray:
     import umap
-except ImportError:
-    umap = None
 
-def load_matrix_and_clusters(mat_path, clusters_path):
-    if not os.path.exists(mat_path):
-        raise SystemExit(f"ERROR: features file not found: {mat_path}")
+    reducer = umap.UMAP(
+        n_components=2,
+        n_neighbors=n_neighbors,
+        min_dist=min_dist,
+        random_state=42,
+    )
+    return reducer.fit_transform(X)
 
-    if not os.path.exists(clusters_path):
-        raise SystemExit(f"ERROR: clusters file not found: {clusters_path}")
 
-    # Matrix: TSV, first column = sample, rest = features
-    df = pd.read_csv(mat_path, sep="\t")
-    if df.shape[1] < 2:
-        raise SystemExit("ERROR: matrix must have at least one feature column")
-    X_raw = df.iloc[:, 1:]
-    X = X_raw.apply(pd.to_numeric, errors="coerce").fillna(-1.0).to_numpy()
+def compute_tsne(X: np.ndarray, perplexity: float, max_iter: int) -> np.ndarray:
+    return TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        init="pca",
+        random_state=42,
+        max_iter=max_iter,
+        learning_rate="auto",
+    ).fit_transform(X)
 
-    # Clusters: CSV with at least column 'cluster'
-    cl = pd.read_csv(clusters_path)
-    if "cluster" not in cl.columns:
-        raise SystemExit("ERROR: clusters CSV must have a 'cluster' column")
-    labels = cl["cluster"].to_numpy()
 
-    # Simple dimension alignment
-    n = min(X.shape[0], labels.shape[0])
-    if X.shape[0] != labels.shape[0]:
-        print(
-            f"WARNING: X has {X.shape[0]} rows, labels has {labels.shape[0]} rows; "
-            f"truncating to {n}."
-        )
-        X = X[:n, :]
-        labels = labels[:n]
+def plot_scatter(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    out_png: str,
+    title: str,
+    xlabel: str | None = None,
+    ylabel: str | None = None,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
-    return X, labels
+    plt.figure(figsize=(7, 5))
 
-def scatter_embed(
-    X_emb,
-    labels,
-    title,
-    out_png,
-    xlabel="dim 1",
-    ylabel="dim 2",
-    figsize=(5, 4),
-    s=10,
-    alpha=0.8,
-    legend_fontsize=8,
-    legend_markerscale=2,
-):
-    cmap = plt.get_cmap("prism")
-    unique = np.unique(labels)
+    labels = df["cluster"].astype(int).values
+    uniq = np.unique(labels)
 
-    plt.figure(figsize=figsize)
-
-    # Controllo di sicurezza: se PCA ha restituito meno di 2 dimensioni (es. varianza target bassa)
-    if X_emb.shape[1] < 2:
-        print(f"WARNING: {title} resulted in fewer than 2 dimensions. Skipping plot.")
-        plt.close()
-        return
-
-    for i, lab in enumerate(unique):
-        m = labels == lab
-        plt.scatter(
-            X_emb[m, 0],
-            X_emb[m, 1],
-            s=s,
-            alpha=alpha,
-            color=cmap(i / max(len(unique) - 1, 1)),
-            label=f"cluster {lab}",
-        )
-
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.legend(markerscale=legend_markerscale, fontsize=legend_fontsize)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="Generate PCA / t-SNE / UMAP plots colored by cluster"
+    sc = plt.scatter(
+        df[x],
+        df[y],
+        c=labels,
+        cmap="Paired",
+        s=18,
+        alpha=0.85,
     )
 
-    # Input/Output
-    ap.add_argument("--pca", required=True, help="TSV matrix (samples x features)")
-    ap.add_argument("--clusters", required=True, help="CSV with column 'cluster'")
-    ap.add_argument("--out_prefix", required=True, help="Output prefix")
-    
-    # Parametri Estetici
-    ap.add_argument("--figsize", default="5,4", help="Figure size (e.g., '5,4')")
-    ap.add_argument("--s", type=int, default=10, help="Marker size")
-    ap.add_argument("--alpha", type=float, default=0.8, help="Marker alpha")
-    ap.add_argument("--xlabel", default="dim 1", help="X-axis label")
-    ap.add_argument("--ylabel", default="dim 2", help="Y-axis label")
-    ap.add_argument("--legend_fontsize", type=int, default=8, help="Legend font size")
-    ap.add_argument("--legend_markerscale", type=int, default=2, help="Legend marker scale")
+    plt.title(title)
+    plt.xlabel(xlabel or x)
+    plt.ylabel(ylabel or y)
 
-    # Parametri Algoritmici (Nuovi)
-    # PCA: se specifichi target_var (float), usa quello, altrimenti usa 2 componenti fisse
-    ap.add_argument("--pca_target_var", type=float, default=None, 
-                    help="PCA explained variance ratio (e.g., 0.95). If set, overrides n_components=2.")
-    
-    # t-SNE
-    ap.add_argument("--tsne_perplexity", type=float, default=30.0, help="t-SNE perplexity")
-    
-    # UMAP
-    ap.add_argument("--umap_n_neighbors", type=int, default=15, help="UMAP n_neighbors")
-    ap.add_argument("--umap_min_dist", type=float, default=0.1, help="UMAP min_dist")
-    ap.add_argument("--umap_metric", type=str, default="euclidean", help="UMAP metric (e.g., euclidean, manhattan, cosine)")
+    # Build a discrete legend (one handle per cluster)
+    handles = [
+        Line2D(
+            [0], [0],
+            marker="o",
+            linestyle="",
+            markersize=7,
+            markerfacecolor=sc.cmap(sc.norm(k)),
+            markeredgecolor="none",
+            label=f"Cluster {k}",
+        )
+        for k in uniq
+    ]
 
+    plt.legend(
+        handles=handles,
+        title="Clusters",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        borderaxespad=0.0,
+        frameon=True,
+    )
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="PCA + UMAP + t-SNE plots colored by cluster")
+    ap.add_argument("--features", required=True, help="TSV used for clustering (sample_id + features)")
+    ap.add_argument("--clusters", required=True, help="TSV with sample_id and cluster")
+    ap.add_argument("--pca-scores", required=True, help="TSV with sample_id and PC columns")
+
+    ap.add_argument("--tsne-perplexity", type=float, default=30.0)
+    ap.add_argument("--tsne-iter", type=int, default=1000)
+    ap.add_argument("--umap-neighbors", type=int, default=15)
+    ap.add_argument("--umap-min-dist", type=float, default=0.1)
+
+    ap.add_argument("--out-umap-tsv", required=True)
+    ap.add_argument("--out-tsne-tsv", required=True)
+    ap.add_argument("--out-umap-png", required=True)
+    ap.add_argument("--out-tsne-png", required=True)
+    ap.add_argument("--out-pca-png", required=True)
     args = ap.parse_args()
 
-    # Parsing figsize
-    try:
-        figsize = tuple(map(int, args.figsize.split(',')))
-    except ValueError:
-        print("WARNING: invalid figsize format, using default (5,4)")
-        figsize = (5, 4)
+    X_df, sample_ids = load_features(args.features)
+    clusters = load_clusters(args.clusters)
 
-    X, labels = load_matrix_and_clusters(args.pca, args.clusters)
+    # Align sample order
+    common = sample_ids[sample_ids.isin(clusters.index)]
+    if len(common) == 0:
+        raise ValueError("No overlapping sample_id between features and clusters")
 
-    # --- PCA ---
-    # Logica: Se pca_target_var è impostato, lo passiamo a n_components (float = % varianza)
-    # Altrimenti n_components = 2 (int = numero componenti)
-    pca_n_comp = args.pca_target_var if args.pca_target_var is not None else 2
-    
-    print(f"Running PCA with n_components={pca_n_comp}...")
-    pca = PCA(n_components=pca_n_comp, random_state=0)
-    X_pca = pca.fit_transform(X)
-    
-    scatter_embed(
-        X_pca,
-        labels,
-        "PCA (clusters)",
-        f"{args.out_prefix}_pca_clusters.png",
-        xlabel=args.xlabel,
-        ylabel=args.ylabel,
-        figsize=figsize,
-        s=args.s,
-        alpha=args.alpha,
-        legend_fontsize=args.legend_fontsize,
-        legend_markerscale=args.legend_markerscale,
+    X = X_df.loc[common.index].values
+    y = clusters.loc[common.values].values
+
+    # UMAP
+    umap_coords = compute_umap(X, args.umap_neighbors, args.umap_min_dist)
+    umap_df = pd.DataFrame(
+        {"sample_id": common.values, "x": umap_coords[:, 0], "y": umap_coords[:, 1], "cluster": y}
     )
+    umap_df.to_csv(args.out_umap_tsv, sep="\t", index=False)
+    plot_scatter(umap_df, "x", "y", args.out_umap_png, "UMAP embedding (colored by cluster)")
 
-    # --- t-SNE ---
-    print(f"Running t-SNE with perplexity={args.tsne_perplexity}...")
-    tsne = TSNE(n_components=2, perplexity=args.tsne_perplexity, random_state=0)
-    X_tsne = tsne.fit_transform(X)
-    scatter_embed(
-        X_tsne,
-        labels,
-        "t-SNE (clusters)",
-        f"{args.out_prefix}_tsne_clusters.png",
-        xlabel=args.xlabel,
-        ylabel=args.ylabel,
-        figsize=figsize,
-        s=args.s,
-        alpha=args.alpha,
-        legend_fontsize=args.legend_fontsize,
-        legend_markerscale=args.legend_markerscale,
+    # t-SNE
+    perp = safe_perplexity(len(common), args.tsne_perplexity)
+    tsne_coords = compute_tsne(X, perp, args.tsne_iter)
+    tsne_df = pd.DataFrame(
+        {"sample_id": common.values, "x": tsne_coords[:, 0], "y": tsne_coords[:, 1], "cluster": y}
     )
+    tsne_df.to_csv(args.out_tsne_tsv, sep="\t", index=False)
+    plot_scatter(tsne_df, "x", "y", args.out_tsne_png, f"t-SNE (perplexity={perp:.1f}) colored by cluster")
 
-    # --- UMAP ---
-    if umap is None:
-        print("WARNING: umap-learn not installed. Skipping UMAP.")
-        X_umap = None
-    else:
-        print(f"Running UMAP with n_neighbors={args.umap_n_neighbors}, min_dist={args.umap_min_dist}, metric={args.umap_metric}...")
-        um = umap.UMAP(
-            n_neighbors=args.umap_n_neighbors,
-            min_dist=args.umap_min_dist,
-            n_components=2,
-            metric=args.umap_metric,
-            random_state=0,
-        )
-        X_umap = um.fit_transform(X)
-        scatter_embed(
-            X_umap,
-            labels,
-            "UMAP (clusters)",
-            f"{args.out_prefix}_umap_clusters.png",
-            xlabel=args.xlabel,
-            ylabel=args.ylabel,
-            figsize=figsize,
-            s=args.s,
-            alpha=args.alpha,
-            legend_fontsize=args.legend_fontsize,
-            legend_markerscale=args.legend_markerscale,
-        )
+    # PCA (first two columns in pca_scores)
+    pca_df = pd.read_csv(args.pca_scores, sep="\t")
+    if "sample_id" not in pca_df.columns:
+        raise ValueError("pca_scores TSV must have a 'sample_id' column")
+    pca_df["sample_id"] = pca_df["sample_id"].astype(str)
+    comp_cols = [c for c in pca_df.columns if c != "sample_id"]
+    if len(comp_cols) < 2:
+        raise ValueError("pca_scores must have at least 2 columns to plot")
+    c1, c2 = comp_cols[0], comp_cols[1]
 
-    # --- Combined Figure ---
-    embeddings = [X_pca, X_tsne]
-    names = ["PCA", "t-SNE"]
-    if X_umap is not None:
-        embeddings.append(X_umap)
-        names.append("UMAP")
-    
-    # Filtra embedding validi (che hanno almeno 2 dimensioni)
-    valid_embeddings = []
-    valid_names = []
-    for emb, nm in zip(embeddings, names):
-        if emb.shape[1] >= 2:
-            valid_embeddings.append(emb)
-            valid_names.append(nm)
-    
-    if not valid_embeddings:
-        print("No valid embeddings with >=2 dimensions for combined plot.")
-        return
+    merged = pca_df.merge(umap_df[["sample_id", "cluster"]], on="sample_id", how="inner")
+    plot_scatter(merged, c1, c2, args.out_pca_png, "PCA (first two components) colored by cluster", c1, c2)
 
-    fig, axes = plt.subplots(1, len(valid_embeddings), figsize=(4 * len(valid_embeddings), 4))
-    if len(valid_embeddings) == 1:
-        axes = [axes]
-
-    cmap = plt.get_cmap("prism")
-    unique = np.unique(labels)
-
-    for ax, emb, name in zip(axes, valid_embeddings, valid_names):
-        for i, lab in enumerate(unique):
-            m = labels == lab
-            ax.scatter(
-                emb[m, 0],
-                emb[m, 1],
-                s=args.s,
-                alpha=args.alpha,
-                color=cmap(i / max(len(unique) - 1, 1)),
-                label=f"{lab}" if ax is axes[0] else None,
-            )
-        ax.set_title(name)
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    axes[0].legend(title="cluster", fontsize=args.legend_fontsize, markerscale=args.legend_markerscale)
-    plt.tight_layout()
-    fig.savefig(f"{args.out_prefix}_combined_embeddings.png", dpi=150)
-    plt.close()
 
 if __name__ == "__main__":
     main()
