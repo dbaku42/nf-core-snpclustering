@@ -48,7 +48,7 @@ Main steps:
      - Optionally intermediate embeddings (if used inside clustering scripts).
 
 5. **Cluster metrics (CLUSTER_METRICS)**  
-   - Computes standard clustering indices for multiple `k` (e.g. 2–8):
+   - Computes standard clustering indices for multiple `k` (e.g. 2–10):
      - Silhouette score  
      - Calinski–Harabasz index  
      - Dunn index  
