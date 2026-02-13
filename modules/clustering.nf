@@ -25,3 +25,14 @@ process CLUSTERING {
       --out_prefix ${mat.baseName}
     """
 }
+workflow clustering_ch {
+
+  take:
+    pca_out_ch
+
+  main:
+    out = CLUSTERING(pca_out_ch)
+
+  emit:
+    clusters = out
+}
