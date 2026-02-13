@@ -30,3 +30,20 @@ process CLUSTER_METRICS {
       --out_prefix ${id}
     """
 }
+workflow cluster_metrics_ch {
+
+  take:
+    pca_out_ch
+    clusters_ch
+
+  main:
+    out = CLUSTER_METRICS(clusters_ch)
+
+  emit:
+    selected       = out.map{ id, metrics_tsv, k_scan_tsv, elbow_png, sil_png, cal_png, dunn_png, metrics_png -> metrics_tsv }
+    k_sweep        = out.map{ id, metrics_tsv, k_scan_tsv, elbow_png, sil_png, cal_png, dunn_png, metrics_png -> k_scan_tsv }
+    elbow          = out.map{ id, metrics_tsv, k_scan_tsv, elbow_png, sil_png, cal_png, dunn_png, metrics_png -> elbow_png }
+    silhouette     = out.map{ id, metrics_tsv, k_scan_tsv, elbow_png, sil_png, cal_png, dunn_png, metrics_png -> sil_png }
+    davies_bouldin = out.map{ id, metrics_tsv, k_scan_tsv, elbow_png, sil_png, cal_png, dunn_png, metrics_png -> metrics_png }
+}
+
