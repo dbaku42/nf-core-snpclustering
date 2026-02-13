@@ -30,3 +30,18 @@ process REPORT {
     printf "Clusters: %s\n" "${clusters}" >> ${id}_report.txt
     """
 }
+workflow report_ch {
+
+  take:
+    clusters_ch
+
+  main:
+    out = REPORT(clusters_ch)
+
+  emit:
+    pca_plot  = out.map{ id, pca_png, tsne_png, umap_png, comb_png, txt -> pca_png }
+    tsne_plot = out.map{ id, pca_png, tsne_png, umap_png, comb_png, txt -> tsne_png }
+    umap_plot = out.map{ id, pca_png, tsne_png, umap_png, comb_png, txt -> umap_png }
+    combined  = out.map{ id, pca_png, tsne_png, umap_png, comb_png, txt -> comb_png }
+    report    = out.map{ id, pca_png, tsne_png, umap_png, comb_png, txt -> txt }
+}
