@@ -124,18 +124,6 @@ workflow {
     viz_out     = cluster_viz_ch(pca_out_ch, clusters_ch)
 
     // 08
-    report_ch(
-        pca_out_ch,
-        clusters_ch,
-        metrics_out.k_sweep,
-        metrics_out.selected,
-        viz_out.umap_embedding,
-        viz_out.tsne_embedding,
-        viz_out.umap_plot,
-        viz_out.tsne_plot,
-        metrics_out.elbow,
-        metrics_out.silhouette,
-        metrics_out.davies_bouldin,
-        viz_out.pca_plot
-    )
+    report_out = report_ch(clusters_ch)
+
 }
