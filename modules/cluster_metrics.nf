@@ -12,13 +12,15 @@ process CLUSTER_METRICS {
       tuple val(id), path(mat), path(clusters)
 
     output:
-      path("${id}_metrics.tsv")
-      path("${id}_k_scan.tsv")
-      path("${id}_elbow.png")
-      path("${id}_silhouette_vs_k.png")
-      path("${id}_calinski_vs_k.png")
-      path("${id}_dunn_vs_k.png")
-      path("${id}_metrics.png")
+      tuple val(id),
+        path("${id}_metrics.tsv"),
+        path("${id}_k_scan.tsv"),
+        path("${id}_elbow.png"),
+        path("${id}_silhouette_vs_k.png"),
+        path("${id}_calinski_vs_k.png"),
+        path("${id}_dunn_vs_k.png"),
+        path("${id}_metrics.png")
+
 
     script:
     """
