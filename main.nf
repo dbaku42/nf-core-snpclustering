@@ -75,7 +75,7 @@ params.flashpca_container = params.flashpca_container ?: 'flashpca2:latest'
 // Modules
 include { preprocess_ch }        from './modules/preprocess.nf'
 include { pruning_ch }           from './modules/pruning.nf'
-include { extraction_matrix_ch } from './modules/extraction_matrix.nf'
+include { extraction_matrix_ch } from './modules/extract_matrix.nf'
 include { pca_ch }               from './modules/pca.nf'
 
 include { clustering_ch }        from './modules/clustering.nf'
