@@ -116,5 +116,7 @@ nextflow run main.nf \
   --pca_engine flashpca \
   --flashpca_container ghcr.io/dbaku42/flashpca2:0.1 \
   --flashpca_bin flashpca \
+  --n_pcs \
+  --algorithm kmeans|dbscan \
   -with-docker
 
