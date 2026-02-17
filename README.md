@@ -71,32 +71,49 @@ Main steps:
 
 - **Nextflow** (>= 22.x recommended)
 - **Java** (for Nextflow)
-- Command-line tools:
-  - `bcftools`
-  - `plink2`
-- Python 3 with:
-  - `numpy`
-  - `pandas`
-  - `matplotlib`
-  - `scikit-learn`
-  - `umap-learn`
+
+### Tools
+- `bcftools`
+- `plink2`
+
+### Python (for clustering / plots / report)
+Python 3 with:
+- `numpy`
+- `pandas`
+- `matplotlib`
+- `scikit-learn`
+- `umap-learn`
 
 You can manage the Python environment with `conda`, `mamba`, or `venv`.
 
+### Optional: FlashPCA2 (containerized)
+If you choose `--pca_engine flashpca`, the pipeline will run PCA using **FlashPCA2**.
+FlashPCA2 is provided via a container (recommended), so you do **not** need to install it on the host system.
+
+To run FlashPCA2 you need **one** of:
+- Docker, or
+- Apptainer/Singularity (HPC-friendly)
+
+
 ---
 
-## 3. Basic usage
+## 3. FlashPCA2 via container (optional)
 
+The pipeline supports two PCA engines:
+- `--pca_engine sklearn` (default, runs with Python/scikit-learn)
+- `--pca_engine flashpca` (runs FlashPCA2 via container)
+
+When `--pca_engine flashpca` is selected, the pipeline will automatically use the FlashPCA2 container.
+
+### 3.1 Use a prebuilt container image (recommended)
+
+Run with Docker:
+```bash
 nextflow run main.nf \
   --vcf path/to/input.vcf.gz \
-  --outdir path/to/results \
-  --n_clusters 3 \
-  --na_filter 0.20 \
-  --pca_target_var 0.7 \
-  --tsne_perplexity 30.0 \
-  --tsne_n_iter 1000 \
-  --umap_n_neighbors 25 \
-  --umap_min_dist 0.1 \
-  --umap_n_components 2 \
-  --umap_metric manhattan
+  --outdir results \
+  --pca_engine flashpca \
+  --flashpca_container ghcr.io/dbaku42/flashpca2:0.1 \
+  --flashpca_bin flashpca \
+  -with-docker
 
