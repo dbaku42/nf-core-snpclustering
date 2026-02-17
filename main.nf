@@ -1,129 +1,120 @@
 nextflow.enable.dsl=2
 
-/*
-Pipeline: VCF
-  01 preprocess        (filter MAF + missing)
-  02 pruning           (LD pruning)
-  03 extraction_matrix (PLINK .raw genotype matrix)   [solo per PCA sklearn]
-  03b plink1_convert   (PLINK2 -> PLINK1 bed/bim/fam) [solo per flashpca2]
-  04 pca               (sklearn OR flashpca2)
-  05 clustering        (KMeans or DBSCAN)
-  06 cluster_metrics   (elbow + silhouette etc.)
-  07 cluster_viz       (UMAP or t-SNE)
-  08 report            (simple HTML report)
-*/
-
-params.vcf            = params.vcf            ?: '/mnt/data/example.vcf.gz'
-params.outdir         = params.outdir         ?: './results'
-params.threads        = params.threads        ?: 4
-
-// preprocess
-params.maf            = params.maf            ?: 0.01
-params.missing        = params.missing        ?: 0.10
-
-// pruning (PLINK2 indep-pairwise)
-params.ld_window_kb   = params.ld_window_kb   ?: 50
-params.ld_step        = params.ld_step        ?: 5
-params.ld_r2          = params.ld_r2          ?: 0.2
+// --- I/O ---
+params.vcf     = params.vcf     ?: '/mnt/data/example.vcf.gz'
+params.outdir  = params.outdir  ?: './results'
 params.threads = params.threads ?: 4
-params.py_container = params.py_container ?: 'python:3.11-slim'
-params.plink2_container = params.plink2_container ?: 'quay.io/biocontainers/plink2:2.00a5.10--h4ac6f70_0'
-params.bcftools_container = params.bcftools_container ?: 'quay.io/biocontainers/bcftools:1.17--h9ee0642_0'
-params.flashpca_container = params.flashpca_container ?: 'flashpca2:latest'   // tua immagine
-params.flashpca_bin = params.flashpca_bin ?: '/home/donald/flashpca/flashpca'
 
-// PCA
-params.n_pcs          = params.n_pcs          ?: 40
+// --- Preprocess ---
+params.maf     = params.maf     ?: 0.01
+params.missing = params.missing ?: 0.10
+
+// --- LD pruning ---
+params.ld_window_kb = params.ld_window_kb ?: 50
+params.ld_step      = params.ld_step      ?: 5
+params.ld_r2        = params.ld_r2        ?: 0.2
+
+// --- PCA ---
+params.n_pcs           = params.n_pcs           ?: 40
 params.ipca_batch_size = params.ipca_batch_size ?: 256
-params.imputer        = params.imputer        ?: 'minus1'
+params.imputer         = params.imputer         ?: 'minus1'
+params.pca_engine      = params.pca_engine      ?: 'sklearn'
 
-// NEW: scegli backend PCA
-//   'sklearn'   -> usa extraction_matrix (.raw) + pca.py (come adesso)
-//   'flashpca2' -> usa plink1_convert (bed/bim/fam) + flashpca2
-params.pca_engine     = params.pca_engine     ?: 'sklearn'   // sklearn|flashpca2
-
-// clustering
-params.k_min = params.k_min ?: 2
-params.dbscan_eps = params.dbscan_eps ?: 0.5
+// --- Clustering ---
+params.algorithm          = params.algorithm          ?: 'kmeans'
+params.n_clusters         = params.n_clusters         ?: 3
+params.k_min              = params.k_min              ?: 2
+params.k_max              = params.k_max              ?: 12
+params.dbscan_eps         = params.dbscan_eps         ?: 0.5
 params.dbscan_min_samples = params.dbscan_min_samples ?: 5
-params.viz_perplexity = params.viz_perplexity ?: 30
-params.viz_tsne_iter = params.viz_tsne_iter ?: 1000
-params.viz_umap_neighbors = params.viz_umap_neighbors ?: 15
-params.viz_umap_min_dist = params.viz_umap_min_dist ?: 0.1
+params.n_init             = params.n_init             ?: 100
+params.init_method        = params.init_method        ?: 'random'
 
-params.algorithm      = params.algorithm      ?: 'kmeans'   // kmeans|dbscan
-params.n_clusters     = params.n_clusters     ?: 3
-params.k_min          = params.k_min          ?: 1
-params.k_max          = params.k_max          ?: 12
-params.dbscan_eps     = params.dbscan_eps     ?: 0.5
-params.dbscan_min_samples = params.dbscan_min_samples ?: 5
-
-// viz
-params.viz_perplexity     = params.viz_perplexity     ?: 30     // t-SNE
+// --- Viz ---
+params.viz_perplexity     = params.viz_perplexity     ?: 30
 params.viz_tsne_iter      = params.viz_tsne_iter      ?: 1000
 params.viz_umap_neighbors = params.viz_umap_neighbors ?: 15
 params.viz_umap_min_dist  = params.viz_umap_min_dist  ?: 0.1
 
-// containers (override as needed)
-params.bcftools_container = params.bcftools_container ?: 'quay.io/biocontainers/bcftools:1.17--h9ee0642_0'
+// --- Containers ---
+params.container_py       = params.container_py       ?: false
 params.plink2_container   = params.plink2_container   ?: 'quay.io/biocontainers/plink2:2.00a5.10--h4ac6f70_0'
-params.py_container       = params.py_container       ?: 'python:3.11-slim'
-
-// NEW: container con flashpca2 (devi metterci flashpca nel PATH)
+params.bcftools_container = params.bcftools_container ?: 'quay.io/biocontainers/bcftools:1.17--h9ee0642_0'
 params.flashpca_container = params.flashpca_container ?: 'flashpca2:latest'
+params.flashpca_bin       = params.flashpca_bin       ?: '/home/donald/flashpca/flashpca'
 
-// Modules
+// --- Modules ---
 include { preprocess_ch }        from './modules/preprocess.nf'
 include { pruning_ch }           from './modules/pruning.nf'
 include { extraction_matrix_ch } from './modules/extract_matrix.nf'
 include { pca_ch }               from './modules/pca.nf'
-
 include { clustering_ch }        from './modules/clustering.nf'
 include { cluster_metrics_ch }   from './modules/cluster_metrics.nf'
 include { cluster_viz_ch }       from './modules/cluster_viz.nf'
 include { report_ch }            from './modules/report.nf'
 
-// Basic validation
+// --- Validation ---
 if( !file(params.vcf).exists() ) {
     exit 1, "VCF file not found: ${params.vcf}"
-}
-if( params.maf < 0 || params.maf > 0.5 ) {
-    exit 1, "params.maf must be between 0 and 0.5"
-}
-if( params.missing < 0 || params.missing > 1 ) {
-    exit 1, "params.missing must be between 0 and 1"
-}
-if( !['sklearn','flashpca2'].contains(params.pca_engine) ) {
-    exit 1, "params.pca_engine must be 'sklearn' or 'flashpca2'"
 }
 
 workflow {
 
-    Channel
-      .fromPath(params.vcf)
-      .set { vcf_ch }
+    Channel.fromPath(params.vcf).set { vcf_ch }
 
-    // 01
+    // 01-04
     filtered_vcf_ch = preprocess_ch(vcf_ch)
-
-    // 02
     pruned_plink_ch = pruning_ch(filtered_vcf_ch)
+    pca_out_ch      = pca_ch(pruned_plink_ch)
+    // pca_out_ch: tuple path(features.tsv), path(scaled.tsv), path(pca_scores.tsv), path(pca_info.json)
 
-    // 03/04: PCA backend switch
-    pca_out_ch = pca_ch(pruned_plink_ch)
-
-
-    // 05
+    // 05 clustering
     clust_out   = clustering_ch(pca_out_ch)
     clusters_ch = clust_out.clusters
+    // clusters_ch: tuple val(id), path(features.tsv), path(clusters.csv), path(clustering_info.json)
 
-    // 06
-    metrics_out = cluster_metrics_ch(pca_out_ch, clusters_ch)
+    // Canali ausiliari taggati con id per i join
+    pca_scores_ch = pca_out_ch.map { features, scaled, pca_scores, pca_info ->
+        tuple(features.baseName, pca_scores)
+    }
+    pca_info_ch = pca_out_ch.map { features, scaled, pca_scores, pca_info ->
+        tuple(features.baseName, pca_info)
+    }
 
-    // 07
-    viz_out     = cluster_viz_ch(pca_out_ch, clusters_ch)
+    // Canale arricchito con pca_scores — usato da CLUSTER_METRICS e CLUSTER_VIZ
+    // [id, mat, clusters, clustering_info, pca_scores]
+    clusters_with_pca_ch = clusters_ch.join(pca_scores_ch)
 
-    // 08
-    report_out = report_ch(clusters_ch)
+    // 06 cluster metrics
+    metrics_out = cluster_metrics_ch(clusters_with_pca_ch)
 
+    // 07 cluster viz
+    viz_out = cluster_viz_ch(clusters_with_pca_ch)
+
+    // 08 report HTML — join di tutti i canali per id
+    report_input_ch = clusters_ch
+        .join( pca_info_ch )
+        .join( metrics_out.k_sweep       .map{ f -> tuple(f.baseName.replaceAll(/_k_sweep$/,         ''), f) } )
+        .join( metrics_out.selected      .map{ f -> tuple(f.baseName.replaceAll(/_selected$/,        ''), f) } )
+        .join( metrics_out.elbow         .map{ f -> tuple(f.baseName.replaceAll(/_elbow$/,           ''), f) } )
+        .join( metrics_out.silhouette    .map{ f -> tuple(f.baseName.replaceAll(/_silhouette$/,      ''), f) } )
+        .join( metrics_out.davies_bouldin.map{ f -> tuple(f.baseName.replaceAll(/_davies_bouldin$/,  ''), f) } )
+        .join( metrics_out.calinski      .map{ f -> tuple(f.baseName.replaceAll(/_calinski$/,        ''), f) } )
+        .join( viz_out.umap_embedding    .map{ f -> tuple(f.baseName.replaceAll(/_umap_embedding$/,  ''), f) } )
+        .join( viz_out.tsne_embedding    .map{ f -> tuple(f.baseName.replaceAll(/_tsne_embedding$/,  ''), f) } )
+        .join( viz_out.umap_plot         .map{ f -> tuple(f.baseName.replaceAll(/_umap_clusters$/,   ''), f) } )
+        .join( viz_out.tsne_plot         .map{ f -> tuple(f.baseName.replaceAll(/_tsne_clusters$/,   ''), f) } )
+        .join( viz_out.pca_plot          .map{ f -> tuple(f.baseName.replaceAll(/_pca_clusters$/,    ''), f) } )
+        .map { id, mat, clusters_csv, clustering_info,
+               pca_info,
+               k_sweep, selected,
+               elbow, sil, db, cal,
+               umap_tsv, tsne_tsv, umap_png, tsne_png, pca_png ->
+            tuple(id, mat, clusters_csv, clustering_info,
+                  pca_info, k_sweep, selected,
+                  elbow, sil, db, cal,
+                  umap_tsv, tsne_tsv, umap_png, tsne_png, pca_png)
+        }
+
+    report_out = report_ch(report_input_ch)
 }
