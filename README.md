@@ -38,7 +38,8 @@ Main steps:
    - Missing calls can be filtered out (`--na_filter`) or encoded as `-1` for clustering.
 
 4. **Clustering (CLUSTERING)**  
-   - Reads the sample × variant dosage matrix.  
+   - Reads the sample × variant dosage matrix.
+   - Reduce dimensionality with PCA
    - Supports **K-means** (default) and optional **DBSCAN**.  
    - Allows tuning of:
      - Number of clusters (`--n_clusters`)
